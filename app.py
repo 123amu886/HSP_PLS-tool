@@ -6,12 +6,40 @@ from io import BytesIO
 st.set_page_config(page_title="HSP & PLS Clinical Trial Extractor", layout="wide")
 st.title("🧬 HSP & PLS Clinical Trial Extractor")
 
-def get_trials(condition, max_studies=100, recruitment_status=None, phase_filter=None, industry_only=False):
+# -----------------------
+# Sidebar Filters
+# -----------------------
+st.sidebar.header("Filter Trials")
+
+status_options = [
+    "Not yet recruiting", "Recruiting", "Enrolling by invitation",
+    "Active, not recruiting", "Completed", "Terminated",
+    "Withdrawn", "Suspended", "Unknown status"
+]
+selected_status = st.sidebar.multiselect(
+    "📌 Trial Status",
+    status_options,
+    default=["Recruiting", "Active, not recruiting"]
+)
+
+industry_only = st.sidebar.checkbox("🏢 Industry Sponsored Only", value=False)
+
+# You can expand this or allow CSV upload
+gene_keywords = [
+    "SPAST", "ATL1", "KIF5A", "ALS2", "PLS3",
+    "SPG4", "REEP1", "SPG11", "SPG7"
+]
+
+# -----------------------
+# Helper Functions
+# -----------------------
+def fetch_trials(condition, max_studies=100):
+    """Query ClinicalTrials.gov API"""
     url = "https://clinicaltrials.gov/api/query/study_fields"
     fields = [
         "BriefTitle", "EnrollmentCount", "InterventionName", "StudyType",
-        "StartDate", "PrimaryCompletionDate", "SponsorName", "LeadSponsorName",
-        "Phase", "OverallStatus", "CollaboratorName", "PrincipalInvestigator"
+        "StartDate", "PrimaryCompletionDate", "SponsorName", "Phase",
+        "OverallStatus", "PrincipalInvestigator"
     ]
     params = {
         "expr": condition,
@@ -20,100 +48,74 @@ def get_trials(condition, max_studies=100, recruitment_status=None, phase_filter
         "max_rnk": max_studies,
         "fmt": "json"
     }
-    r = requests.get(url, params=params)
-    if r.status_code != 200:
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        return response.json().get("StudyFieldsResponse", {}).get("StudyFields", [])
+    else:
         return []
-    studies = r.json().get("StudyFieldsResponse", {}).get("StudyFields", [])
-    
-    filtered = []
-    for s in studies:
-        status = "; ".join(s.get("OverallStatus", [])).strip().lower()
-        phase = "; ".join(s.get("Phase", [])).strip().lower()
-        sponsor = "; ".join(s.get("LeadSponsorName", [])).strip().lower()
-        
-        if recruitment_status and recruitment_status.lower() not in status:
-            continue
-        if phase_filter and phase_filter.lower() not in phase:
-            continue
-        if industry_only and not any(ind in sponsor for ind in ["inc", "ltd", "pharma", "gmbh", "s.a.", "llc", "plc", "corporation"]):
-            continue
-        
-        filtered.append(s)
-    return filtered
 
-def format_trials(raw_data, gene_mapping=None):
-    rows = []
-    for study in raw_data:
-        interventions = "; ".join(study.get("InterventionName", []))
-        trial_name = "; ".join(study.get("BriefTitle", []))
-        gene_target = ""
-        if gene_mapping:
-            for gene in gene_mapping:
-                if gene.lower() in trial_name.lower() or gene.lower() in interventions.lower():
-                    gene_target = gene
-                    break
-        rows.append({
-            "Trial Name": trial_name,
+def tag_genes(text):
+    """Return matched gene symbols in title/intervention"""
+    return ", ".join([g for g in gene_keywords if g.lower() in text.lower()])
+
+def format_trial_data(studies):
+    """Convert raw trials to structured DataFrame"""
+    records = []
+
+    for study in studies:
+        status = "; ".join(study.get("OverallStatus", []))
+        sponsor = "; ".join(study.get("SponsorName", [])).lower()
+
+        if status not in selected_status:
+            continue
+
+        if industry_only:
+            if not any(keyword in sponsor for keyword in ["inc", "ltd", "pharma", "gmbh", "corp", "biosciences"]):
+                continue
+
+        title = "; ".join(study.get("BriefTitle", []))
+        drug = "; ".join(study.get("InterventionName", []))
+        gene = tag_genes(title + " " + drug)
+
+        records.append({
+            "Trial Name": title,
             "Participants": "; ".join(study.get("EnrollmentCount", [])),
-            "Drug": interventions,
+            "Drug": drug,
             "Type(Obs/Int)": "; ".join(study.get("StudyType", [])),
             "TimeFrame Start": "; ".join(study.get("StartDate", [])),
             "TimeFrame End": "; ".join(study.get("PrimaryCompletionDate", [])),
-            "Sponsor": "; ".join(study.get("LeadSponsorName", [])),
+            "Sponsor": "; ".join(study.get("SponsorName", [])),
             "Investigator": "; ".join(study.get("PrincipalInvestigator", [])),
             "Notes": "",
             "Phase": "; ".join(study.get("Phase", [])),
-            "Gene/Pathway": gene_target
+            "Status": status,
+            "Gene/Pathway": gene
         })
-    return pd.DataFrame(rows)
 
-# UI filters
-st.sidebar.header("🔍 Filters")
-recruitment_status = st.sidebar.selectbox(
-    "Recruitment Status",
-    ["", "Recruiting", "Not yet recruiting", "Active, not recruiting", "Completed", "Suspended", "Withdrawn"],
-    index=0
-)
-phase_filter = st.sidebar.selectbox(
-    "Study Phase",
-    ["", "Phase 1", "Phase 2", "Phase 3", "Phase 4"],
-    index=0
-)
-industry_only = st.sidebar.checkbox("Industry Only Trials")
+    return pd.DataFrame(records)
 
-uploaded_gene_file = st.sidebar.file_uploader("Optional: Upload Gene Mapping (CSV with column 'Gene')")
-
-gene_list = None
-if uploaded_gene_file:
-    gene_df = pd.read_csv(uploaded_gene_file)
-    gene_list = gene_df["Gene"].dropna().tolist()
-
+# -----------------------
+# Main UI Trigger
+# -----------------------
 if st.button("🔍 Fetch Clinical Trials"):
-    with st.spinner("Fetching trials from ClinicalTrials.gov..."):
-        hsp_raw = get_trials(
-            "Hereditary Spastic Paraplegia",
-            recruitment_status=recruitment_status if recruitment_status else None,
-            phase_filter=phase_filter if phase_filter else None,
-            industry_only=industry_only
-        )
-        pls_raw = get_trials(
-            "Primary Lateral Sclerosis",
-            recruitment_status=recruitment_status if recruitment_status else None,
-            phase_filter=phase_filter if phase_filter else None,
-            industry_only=industry_only
-        )
-        hsp_df = format_trials(hsp_raw, gene_mapping=gene_list)
-        pls_df = format_trials(pls_raw, gene_mapping=gene_list)
+
+    with st.spinner("Fetching HSP & PLS trials from ClinicalTrials.gov..."):
+        hsp_raw = fetch_trials("Hereditary Spastic Paraplegia")
+        pls_raw = fetch_trials("Primary Lateral Sclerosis")
+
+        hsp_df = format_trial_data(hsp_raw)
+        pls_df = format_trial_data(pls_raw)
 
         output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
             hsp_df.to_excel(writer, index=False, sheet_name="HSP Trials")
             pls_df.to_excel(writer, index=False, sheet_name="PLS Trials")
+        output.seek(0)  # 🔁 ensure buffer is reset
 
-        st.success(f"✅ Done! {len(hsp_df)} HSP trials and {len(pls_df)} PLS trials ready.")
+        st.success("✅ Excel file ready!")
         st.download_button(
-            "📥 Download Excel File",
-            output.getvalue(),
+            label="📥 Download Excel File",
+            data=output,
             file_name="HSP_PLS_Clinical_Trials.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
